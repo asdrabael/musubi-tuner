@@ -31,6 +31,7 @@ class BaseDatasetParams:
     bucket_no_upscale: bool = False
     caption_extension: Optional[str] = None
     batch_size: int = 1
+    num_repeats: int = 1
     cache_directory: Optional[str] = None
     debug_dataset: bool = False
 
@@ -49,6 +50,8 @@ class VideoDatasetParams(BaseDatasetParams):
     frame_extraction: Optional[str] = "head"
     frame_stride: Optional[int] = 1
     frame_sample: Optional[int] = 1
+    conditioning_directory: Optional[str] = None
+    conditioning_cache: Optional[str] = None  # Add this field
 
 
 @dataclass
@@ -88,6 +91,7 @@ class ConfigSanitizer:
     DATASET_ASCENDABLE_SCHEMA = {
         "caption_extension": str,
         "batch_size": int,
+        "num_repeats": int,
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
         "enable_bucket": bool,
         "bucket_no_upscale": bool,
@@ -105,6 +109,8 @@ class ConfigSanitizer:
         "frame_stride": int,
         "frame_sample": int,
         "cache_directory": str,
+        "conditioning_directory": str,  # New validation rule
+        "conditioning_cache": str,     # New validation rule
     }
 
     # options handled by argparse but not handled by user config
@@ -176,7 +182,10 @@ class ConfigSanitizer:
 
 
 class BlueprintGenerator:
-    BLUEPRINT_PARAM_NAME_TO_CONFIG_OPTNAME = {}
+    BLUEPRINT_PARAM_NAME_TO_CONFIG_OPTNAME = {
+        'conditioning_directory': 'conditioning_directory',
+        'conditioning_cache': 'conditioning_cache',
+      }
 
     def __init__(self, sanitizer: ConfigSanitizer):
         self.sanitizer = sanitizer
@@ -196,7 +205,10 @@ class BlueprintGenerator:
                 dataset_params_klass = ImageDatasetParams
             else:
                 dataset_params_klass = VideoDatasetParams
-
+            
+            if "conditioning_directory" not in dataset_config:
+                dataset_config.pop("conditioning_cache", None)
+            
             params = self.generate_params_by_fallbacks(
                 dataset_params_klass, [dataset_config, general_config, argparse_config, runtime_params]
             )
@@ -205,6 +217,15 @@ class BlueprintGenerator:
         dataset_group_blueprint = DatasetGroupBlueprint(dataset_blueprints)
 
         return Blueprint(dataset_group_blueprint)
+    
+    def generate_conditioning_blueprint(self, user_config: dict, args, conditioning_dir: str):
+        # Override video_directory and cache_directory for conditioning
+        user_config_conditioning = copy.deepcopy(user_config)
+        for dataset_config in user_config_conditioning.get("datasets", []):
+            dataset_config["video_directory"] = conditioning_dir
+            dataset_config["cache_directory"] = dataset_config.get("conditioning_cache")  # Use conditioning_cache path
+            dataset_config.pop("conditioning_directory", None)  # Remove to avoid conflicts
+        return self.generate(user_config_conditioning, args)
 
     @staticmethod
     def generate_params_by_fallbacks(param_klass, fallbacks: Sequence[dict]):
@@ -231,16 +252,21 @@ class BlueprintGenerator:
 def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlueprint, training: bool = False) -> DatasetGroup:
     datasets: List[Union[ImageDataset, VideoDataset]] = []
 
+    # Iterate over each DatasetBlueprint in the DatasetGroupBlueprint
     for dataset_blueprint in dataset_group_blueprint.datasets:
+        params = asdict(dataset_blueprint.params)
+        print(f"Initializing with params: {params}")
         if dataset_blueprint.is_image_dataset:
-            dataset_klass = ImageDataset
+            # Initialize ImageDataset with params
+            dataset = ImageDataset(**asdict(dataset_blueprint.params))
         else:
-            dataset_klass = VideoDataset
-
-        dataset = dataset_klass(**asdict(dataset_blueprint.params))
+            # Initialize VideoDataset with params
+            dataset = VideoDataset(**asdict(dataset_blueprint.params))
+        
+        # Add the initialized dataset to the list
         datasets.append(dataset)
 
-    # assertion
+    # Validate cache directories
     cache_directories = [dataset.cache_directory for dataset in datasets]
     num_of_unique_cache_directories = len(set(cache_directories))
     if num_of_unique_cache_directories != len(cache_directories):
@@ -249,7 +275,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
             + " / cache directory は各データセットごとに異なる必要があります（指定されていない場合はimage/video directoryが使われるので注意）"
         )
 
-    # print info
+    # Print dataset info
     info = ""
     for i, dataset in enumerate(datasets):
         is_image_dataset = isinstance(dataset, ImageDataset)
@@ -259,6 +285,7 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
         is_image_dataset: {is_image_dataset}
         resolution: {dataset.resolution}
         batch_size: {dataset.batch_size}
+        num_repeats: {dataset.num_repeats}
         caption_extension: "{dataset.caption_extension}"
         enable_bucket: {dataset.enable_bucket}
         bucket_no_upscale: {dataset.bucket_no_upscale}
@@ -293,17 +320,15 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
             )
     logger.info(f"{info}")
 
-    # make buckets first because it determines the length of dataset
-    # and set the same seed for all datasets
+    # Set the same seed for all datasets
     seed = random.randint(0, 2**31)  # actual seed is seed + epoch_no
     for i, dataset in enumerate(datasets):
-        # logger.info(f"[Dataset {i}]")
         dataset.set_seed(seed)
         if training:
             dataset.prepare_for_training()
 
+    # Return DatasetGroup with initialized datasets
     return DatasetGroup(datasets)
-
 
 def load_user_config(file: str) -> dict:
     file: Path = Path(file)

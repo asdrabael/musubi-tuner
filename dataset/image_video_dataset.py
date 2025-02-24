@@ -49,7 +49,28 @@ try:
 except:
     pass
 
-VIDEO_EXTENSIONS = [".mp4", ".avi", ".mov", ".webm", ".MP4", ".AVI", ".MOV", ".WEBM"]  # some of them are not tested
+VIDEO_EXTENSIONS = [
+    ".mp4",
+    ".webm",
+    ".avi",
+    ".mkv",
+    ".mov",
+    ".flv",
+    ".wmv",
+    ".m4v",
+    ".mpg",
+    ".mpeg",
+    ".MP4",
+    ".WEBM",
+    ".AVI",
+    ".MKV",
+    ".MOV",
+    ".FLV",
+    ".WMV",
+    ".M4V",
+    ".MPG",
+    ".MPEG",
+]  # some of them are not tested
 
 ARCHITECTURE_HUNYUAN_VIDEO = "hv"
 
@@ -149,31 +170,29 @@ class ItemInfo:
         )
 
 
-def save_latent_cache(item_info: ItemInfo, latent: torch.Tensor):
+def save_latent_cache(item: ItemInfo, latent: torch.Tensor):
     assert latent.dim() == 4, "latent should be 4D tensor (frame, channel, height, width)"
 
     # NaN check and show warning, replace NaN with 0
     if torch.isnan(latent).any():
-        logger.warning(f"latent tensor has NaN: {item_info.item_key}, replace NaN with 0")
+        logger.warning(f"latent tensor has NaN: {item.item_key}, replace NaN with 0")  # Changed item_info -> item
         latent[torch.isnan(latent)] = 0
 
     metadata = {
         "architecture": "hunyuan_video",
-        "width": f"{item_info.original_size[0]}",
-        "height": f"{item_info.original_size[1]}",
+        "width": f"{item.original_size[0]}",  # Changed ItemInfo -> item
+        "height": f"{item.original_size[1]}",  # Changed ItemInfo -> item
         "format_version": "1.0.0",
     }
-    if item_info.frame_count is not None:
-        metadata["frame_count"] = f"{item_info.frame_count}"
+    if item.frame_count is not None:  # Changed item_info -> item
+        metadata["frame_count"] = f"{item.frame_count}"
 
     _, F, H, W = latent.shape
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu()}
 
-    latent_dir = os.path.dirname(item_info.latent_cache_path)
-    os.makedirs(latent_dir, exist_ok=True)
-
-    save_file(sd, item_info.latent_cache_path, metadata=metadata)
+    os.makedirs(os.path.dirname(item.latent_cache_path), exist_ok=True)
+    save_file(sd, item.latent_cache_path, metadata=metadata)
 
 
 def save_text_encoder_output_cache(item_info: ItemInfo, embed: torch.Tensor, mask: Optional[torch.Tensor], is_llm: bool):
@@ -273,10 +292,13 @@ def load_video(
     start_frame: Optional[int] = None,
     end_frame: Optional[int] = None,
     bucket_selector: Optional[BucketSelector] = None,
+    bucket_reso: Optional[tuple[int, int]] = None,
 ) -> list[np.ndarray]:
+    """
+    bucket_reso: if given, resize the video to the bucket resolution, (width, height)
+    """
     container = av.open(video_path)
     video = []
-    bucket_reso = None
     for i, frame in enumerate(container.decode(video=0)):
         if start_frame is not None and i < start_frame:
             continue
@@ -334,11 +356,12 @@ class BucketBatchManager:
         bucket = self.buckets[bucket_reso]
         start = batch_idx * self.batch_size
         end = min(start + self.batch_size, len(bucket))
-
+        
         latents = []
         llm_embeds = []
         llm_masks = []
         clip_l_embeds = []
+        pose_latents = []
         for item_info in bucket[start:end]:
             sd = load_file(item_info.latent_cache_path)
             latent = None
@@ -347,7 +370,7 @@ class BucketBatchManager:
                     latent = sd[key]
                     break
             latents.append(latent)
-
+        
             sd = load_file(item_info.text_encoder_output_cache_path)
             llm_embed = llm_mask = clip_l_embed = None
             for key in sd.keys():
@@ -362,13 +385,29 @@ class BucketBatchManager:
             llm_embeds.append(llm_embed)
             llm_masks.append(llm_mask)
             clip_l_embeds.append(clip_l_embed)
-
+        
+            # Use item_info.latent_cache_path instead of item.latent_cache_path
+            pose_path = item_info.latent_cache_path.replace(f"_{ARCHITECTURE_HUNYUAN_VIDEO}.safetensors",
+                                                             f"_{ARCHITECTURE_HUNYUAN_VIDEO}_pose.safetensors")
+            if self.dataset.conditioning_directory:  # New condition
+                pose_path = os.path.join(
+                    self.dataset.conditioning_directory,
+                    os.path.basename(pose_path)
+                )
+            if not os.path.exists(pose_path):
+                logger.warning(f"Pose cache file not found: {pose_path}")
+                pose_latents.append(torch.zeros_like(torch.stack(latents)[0]))
+            else:
+                pose_dict = load_file(pose_path)
+                pose_latents.append(pose_dict["latent"])
+        
         latents = torch.stack(latents)
         llm_embeds = torch.stack(llm_embeds)
         llm_masks = torch.stack(llm_masks)
         clip_l_embeds = torch.stack(clip_l_embeds)
-
-        return latents, llm_embeds, llm_masks, clip_l_embeds
+        pose_embeds = torch.stack(pose_latents)
+        
+        return latents, llm_embeds, llm_masks, clip_l_embeds, pose_embeds
 
 
 class ContentDatasource:
@@ -587,8 +626,8 @@ class VideoDirectoryDatasource(VideoDatasource):
         self.caption_extension = caption_extension
         self.current_idx = 0
 
-        # glob images
-        logger.info(f"glob images in {self.video_directory}")
+        # glob videos
+        logger.info(f"glob videos in {self.video_directory}")
         self.video_paths = glob_videos(self.video_directory)
         logger.info(f"found {len(self.video_paths)} videos")
 
@@ -614,10 +653,14 @@ class VideoDirectoryDatasource(VideoDatasource):
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         video_path = self.video_paths[idx]
-        caption_path = os.path.splitext(video_path)[0] + self.caption_extension if self.caption_extension else ""
-        with open(caption_path, "r", encoding="utf-8") as f:
-            caption = f.read().strip()
-        return video_path, caption
+        if self.caption_extension:
+            caption_path = os.path.splitext(video_path)[0] + self.caption_extension
+            if os.path.exists(caption_path):
+                with open(caption_path, "r", encoding="utf-8") as f:
+                    caption = f.read().strip()
+                return video_path, caption
+        # Return an empty caption if no caption file exists
+        return video_path, ""
 
     def __iter__(self):
         self.current_idx = 0
@@ -719,6 +762,7 @@ class BaseDataset(torch.utils.data.Dataset):
         resolution: Tuple[int, int] = (960, 544),
         caption_extension: Optional[str] = None,
         batch_size: int = 1,
+        num_repeats: int = 1,
         enable_bucket: bool = False,
         bucket_no_upscale: bool = False,
         cache_directory: Optional[str] = None,
@@ -727,6 +771,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.resolution = resolution
         self.caption_extension = caption_extension
         self.batch_size = batch_size
+        self.num_repeats = num_repeats
         self.enable_bucket = enable_bucket
         self.bucket_no_upscale = bucket_no_upscale
         self.cache_directory = cache_directory
@@ -742,16 +787,44 @@ class BaseDataset(torch.utils.data.Dataset):
             "resolution": self.resolution,
             "caption_extension": self.caption_extension,
             "batch_size_per_device": self.batch_size,
+            "num_repeats": self.num_repeats,
             "enable_bucket": bool(self.enable_bucket),
             "bucket_no_upscale": bool(self.bucket_no_upscale),
         }
         return metadata
 
+    def get_all_latent_cache_files(self):
+        return glob.glob(os.path.join(self.cache_directory, f"*_{ARCHITECTURE_HUNYUAN_VIDEO}.safetensors"))
+
+    def get_all_text_encoder_output_cache_files(self):
+        return glob.glob(os.path.join(self.cache_directory, f"*_{ARCHITECTURE_HUNYUAN_VIDEO}_te.safetensors"))
+
     def get_latent_cache_path(self, item_info: ItemInfo) -> str:
+        """
+        Returns the cache path for the latent tensor.
+
+        item_info: ItemInfo object
+
+        Returns:
+            str: cache path
+
+        cache_path is based on the item_key and the resolution.
+        """
         w, h = item_info.original_size
         basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
-        assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
-        return os.path.join(self.cache_directory, f"{basename}_{w:04d}x{h:04d}_{ARCHITECTURE_HUNYUAN_VIDEO}.safetensors")
+        if getattr(self, "is_conditioning", False) and hasattr(self, "conditioning_cache"):
+             # Use conditioning cache directory
+            return os.path.join(
+                self.conditioning_cache,
+                f"{basename}_{w:04d}x{h:04d}_{ARCHITECTURE_HUNYUAN_VIDEO}.safetensors"
+            )
+        else:
+            # Use regular cache directory
+            return os.path.join(
+                self.cache_directory,
+                f"{basename}_{w:04d}x{h:04d}_{ARCHITECTURE_HUNYUAN_VIDEO}.safetensors"
+            )
+        return super().get_latent_cache_path(item_info)
 
     def get_text_encoder_output_cache_path(self, item_info: ItemInfo) -> str:
         basename = os.path.splitext(os.path.basename(item_info.item_key))[0]
@@ -860,6 +933,7 @@ class ImageDataset(BaseDataset):
         resolution: Tuple[int, int],
         caption_extension: Optional[str],
         batch_size: int,
+        num_repeats: int,
         enable_bucket: bool,
         bucket_no_upscale: bool,
         image_directory: Optional[str] = None,
@@ -868,7 +942,7 @@ class ImageDataset(BaseDataset):
         debug_dataset: bool = False,
     ):
         super(ImageDataset, self).__init__(
-            resolution, caption_extension, batch_size, enable_bucket, bucket_no_upscale, cache_directory, debug_dataset
+            resolution, caption_extension, batch_size, num_repeats, enable_bucket, bucket_no_upscale, cache_directory, debug_dataset
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
@@ -903,6 +977,7 @@ class ImageDataset(BaseDataset):
         batches: dict[tuple[int, int], list[ItemInfo]] = {}  # (width, height) -> [ItemInfo]
         futures = []
 
+        # aggregate futures and sort by bucket resolution
         def aggregate_future(consume_all: bool = False):
             while len(futures) >= num_workers or (consume_all and len(futures) > 0):
                 completed_futures = [future for future in futures if future.done()]
@@ -927,6 +1002,7 @@ class ImageDataset(BaseDataset):
 
                     futures.remove(future)
 
+        # submit batch if some bucket has enough items
         def submit_batch(flush: bool = False):
             for key in batches:
                 if len(batches[key]) >= self.batch_size or flush:
@@ -940,6 +1016,7 @@ class ImageDataset(BaseDataset):
 
         for fetch_op in self.datasource:
 
+            # fetch and resize image in a separate thread
             def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, Image.Image, str]:
                 image_key, image, caption = op()
                 image: Image.Image
@@ -998,7 +1075,8 @@ class ImageDataset(BaseDataset):
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
 
             bucket = bucketed_item_info.get(bucket_reso, [])
-            bucket.append(item_info)
+            for _ in range(self.num_repeats):
+                bucket.append(item_info)
             bucketed_item_info[bucket_reso] = bucket
 
         # prepare batch manager
@@ -1027,6 +1105,7 @@ class VideoDataset(BaseDataset):
         resolution: Tuple[int, int],
         caption_extension: Optional[str],
         batch_size: int,
+        num_repeats: int,
         enable_bucket: bool,
         bucket_no_upscale: bool,
         frame_extraction: Optional[str] = "head",
@@ -1036,29 +1115,45 @@ class VideoDataset(BaseDataset):
         video_directory: Optional[str] = None,
         video_jsonl_file: Optional[str] = None,
         cache_directory: Optional[str] = None,
+        conditioning_directory: Optional[str] = None,
+        conditioning_cache: Optional[str] = None,
         debug_dataset: bool = False,
     ):
         super(VideoDataset, self).__init__(
-            resolution, caption_extension, batch_size, enable_bucket, bucket_no_upscale, cache_directory, debug_dataset
+            resolution, caption_extension, batch_size, num_repeats, enable_bucket, bucket_no_upscale, cache_directory, debug_dataset
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
-        self.target_frames = target_frames
+        self.conditioning_directory = conditioning_directory
+        self.conditioning_cache = conditioning_cache
+        self.target_frames = target_frames or [1]
         self.frame_extraction = frame_extraction
         self.frame_stride = frame_stride
         self.frame_sample = frame_sample
 
-        if video_directory is not None:
-            self.datasource = VideoDirectoryDatasource(video_directory, caption_extension)
-        elif video_jsonl_file is not None:
-            self.datasource = VideoJsonlDatasource(video_jsonl_file)
+        # Validate that either video_directory or video_jsonl_file is provided
+        if self.video_directory is None and self.video_jsonl_file is None:
+            raise ValueError("Either video_directory or video_jsonl_file must be specified")
+
+        # Initialize main video datasource
+        if self.video_directory is not None:
+            self.datasource = VideoDirectoryDatasource(self.video_directory, caption_extension)
+        elif self.video_jsonl_file is not None:
+            self.datasource = VideoJsonlDatasource(self.video_jsonl_file)
+
+        # Initialize conditioning datasource if provided
+        if self.conditioning_directory is not None:
+            self.conditioning_datasource = VideoDirectoryDatasource(self.conditioning_directory, caption_extension)
+        else:
+            self.conditioning_datasource = None
 
         if self.frame_extraction == "uniform" and self.frame_sample == 1:
             self.frame_extraction = "head"
-            logger.warning("frame_sample is set to 1 for frame_extraction=uniform. frame_extraction is changed to head.")
+            logger.warning("frame_sample=1 with uniform extraction, changed to head")
         if self.frame_extraction == "head":
-            # head extraction. we can limit the number of frames to be extracted
             self.datasource.set_start_and_end_frame(0, max(self.target_frames))
+            if self.conditioning_datasource is not None:
+                self.conditioning_datasource.set_start_and_end_frame(0, max(self.target_frames))
 
         if self.cache_directory is None:
             self.cache_directory = self.video_directory
@@ -1081,117 +1176,177 @@ class VideoDataset(BaseDataset):
     def retrieve_latent_cache_batches(self, num_workers: int):
         buckset_selector = BucketSelector(self.resolution)
         self.datasource.set_bucket_selector(buckset_selector)
+        if self.conditioning_datasource is not None:
+            self.conditioning_datasource.set_bucket_selector(buckset_selector)
 
         executor = ThreadPoolExecutor(max_workers=num_workers)
 
-        # key: (width, height, frame_count), value: [ItemInfo]
-        batches: dict[tuple[int, int, int], list[ItemInfo]] = {}
-        futures = []
+        try:
+            batches: dict[tuple[int, int, int], list[ItemInfo]] = {}
+            futures = []
 
-        def aggregate_future(consume_all: bool = False):
-            while len(futures) >= num_workers or (consume_all and len(futures) > 0):
-                completed_futures = [future for future in futures if future.done()]
-                if len(completed_futures) == 0:
-                    if len(futures) >= num_workers or consume_all:  # to avoid adding too many futures
-                        time.sleep(0.1)
-                        continue
-                    else:
-                        break  # submit batch if possible
+            def process_video(video_key, video, caption, is_conditioning, original_frame_size):
+                frame_count = len(video)
+                video = np.stack(video, axis=0)
+                height, width = video.shape[1:3]
+                bucket_reso = (width, height)  # already resized
 
-                for future in completed_futures:
-                    original_frame_size, video_key, video, caption = future.result()
+                crop_pos_and_frames = []
+                if self.frame_extraction == "head":
+                    for target_frame in self.target_frames:
+                        if frame_count >= target_frame:
+                            crop_pos_and_frames.append((0, target_frame))
+                elif self.frame_extraction == "chunk":
+                    # split by target_frames
+                    for target_frame in self.target_frames:
+                        for i in range(0, frame_count, target_frame):
+                            if i + target_frame <= frame_count:
+                                crop_pos_and_frames.append((i, target_frame))
+                elif self.frame_extraction == "slide":
+                    # slide window
+                    for target_frame in self.target_frames:
+                        if frame_count >= target_frame:
+                            for i in range(0, frame_count - target_frame + 1, self.frame_stride):
+                                crop_pos_and_frames.append((i, target_frame))
+                elif self.frame_extraction == "uniform":
+                    # select N frames uniformly
+                    for target_frame in self.target_frames:
+                        if frame_count >= target_frame:
+                            frame_indices = np.linspace(0, frame_count - target_frame, self.frame_sample, dtype=int)
+                            for i in frame_indices:
+                                crop_pos_and_frames.append((i, target_frame))
+                else:
+                    raise ValueError(f"frame_extraction {self.frame_extraction} is not supported")
 
-                    frame_count = len(video)
-                    video = np.stack(video, axis=0)
-                    height, width = video.shape[1:3]
-                    bucket_reso = (width, height)  # already resized
+                for crop_pos, target_frame in crop_pos_and_frames:
+                    cropped_video = video[crop_pos : crop_pos + target_frame]
+                    body, ext = os.path.splitext(video_key)
+                    item_key = f"{body}_{crop_pos:05d}-{target_frame:03d}{ext}"
+                    if is_conditioning:
+                        item_key = f"conditioning_{item_key}"  # Mark as conditioning data
+                    batch_key = (*bucket_reso, target_frame)  # bucket_reso with frame_count
 
-                    crop_pos_and_frames = []
-                    if self.frame_extraction == "head":
-                        for target_frame in self.target_frames:
-                            if frame_count >= target_frame:
-                                crop_pos_and_frames.append((0, target_frame))
-                    elif self.frame_extraction == "chunk":
-                        # split by target_frames
-                        for target_frame in self.target_frames:
-                            for i in range(0, frame_count, target_frame):
-                                if i + target_frame <= frame_count:
-                                    crop_pos_and_frames.append((i, target_frame))
-                    elif self.frame_extraction == "slide":
-                        # slide window
-                        for target_frame in self.target_frames:
-                            if frame_count >= target_frame:
-                                for i in range(0, frame_count - target_frame + 1, self.frame_stride):
-                                    crop_pos_and_frames.append((i, target_frame))
-                    elif self.frame_extraction == "uniform":
-                        # select N frames uniformly
-                        for target_frame in self.target_frames:
-                            if frame_count >= target_frame:
-                                frame_indices = np.linspace(0, frame_count - target_frame, self.frame_sample, dtype=int)
-                                for i in frame_indices:
-                                    crop_pos_and_frames.append((i, target_frame))
-                    else:
-                        raise ValueError(f"frame_extraction {self.frame_extraction} is not supported")
-
-                    for crop_pos, target_frame in crop_pos_and_frames:
-                        cropped_video = video[crop_pos : crop_pos + target_frame]
-                        body, ext = os.path.splitext(video_key)
-                        item_key = f"{body}_{crop_pos:05d}-{target_frame:03d}{ext}"
-                        batch_key = (*bucket_reso, target_frame)  # bucket_reso with frame_count
-
-                        item_info = ItemInfo(
-                            item_key, caption, original_frame_size, batch_key, frame_count=target_frame, content=cropped_video
+                    item_info = ItemInfo(
+                        item_key,
+                        caption,
+                        original_frame_size,  # Now uses the passed argument
+                        batch_key,
+                        frame_count=target_frame,
+                        content=cropped_video
+                    )
+                    # Set latent_cache_path based on whether it's a conditioning video
+                    if is_conditioning:
+                        item_info.latent_cache_path = os.path.join(
+                            self.conditioning_cache,
+                            f"{os.path.splitext(os.path.basename(item_key))[0]}_{bucket_reso[0]:04d}x{bucket_reso[1]:04d}_{ARCHITECTURE_HUNYUAN_VIDEO}.safetensors"
                         )
-                        item_info.latent_cache_path = self.get_latent_cache_path(item_info)
-
-                        batch = batches.get(batch_key, [])
-                        batch.append(item_info)
-                        batches[batch_key] = batch
-
-                    futures.remove(future)
-
-        def submit_batch(flush: bool = False):
-            for key in batches:
-                if len(batches[key]) >= self.batch_size or flush:
-                    batch = batches[key][0 : self.batch_size]
-                    if len(batches[key]) > self.batch_size:
-                        batches[key] = batches[key][self.batch_size :]
                     else:
-                        del batches[key]
-                    return key, batch
-            return None, None
+                        item_info.latent_cache_path = os.path.join(
+                            self.cache_directory,
+                            f"{os.path.splitext(os.path.basename(item_key))[0]}_{bucket_reso[0]:04d}x{bucket_reso[1]:04d}_{ARCHITECTURE_HUNYUAN_VIDEO}.safetensors"
+                        )
 
-        for operator in self.datasource:
+                    batch = batches.get(batch_key, [])
+                    batch.append(item_info)
+                    batches[batch_key] = batch
 
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str]:
-                video_key, video, caption = op()
-                video: list[np.ndarray]
-                frame_size = (video[0].shape[1], video[0].shape[0])
+            def aggregate_future(consume_all: bool = False):
+                while len(futures) >= num_workers or (consume_all and len(futures) > 0):
+                    completed_futures = [future for future in futures if future.done()]
+                    if len(completed_futures) == 0:
+                        if len(futures) >= num_workers or consume_all:  # to avoid adding too many futures
+                            time.sleep(0.1)
+                            continue
+                        else:
+                            break  # submit batch if possible
 
-                # resize if necessary
-                bucket_reso = buckset_selector.get_bucket_resolution(frame_size)
-                video = [resize_image_to_bucket(frame, bucket_reso) for frame in video]
+                    for future in completed_futures:
+                        try:
+                            original_frame_size, video_key, video, caption, is_conditioning = future.result()
+                            process_video(video_key, video, caption, is_conditioning, original_frame_size)
+                        except Exception as e:
+                            logger.error(f"Error processing video: {e}")
+                        finally:
+                            futures.remove(future)
 
-                return frame_size, video_key, video, caption
+            def submit_batch(flush: bool = False):
+                for key in batches:
+                    if len(batches[key]) >= self.batch_size or flush:
+                        batch = batches[key][:self.batch_size]
+                        if len(batches[key]) > self.batch_size:
+                            batches[key] = batches[key][self.batch_size:]
+                        else:
+                            del batches[key]
+                        return key, batch
+                return None, None
 
-            future = executor.submit(fetch_and_resize, operator)
-            futures.append(future)
-            aggregate_future()
+            # Process main videos
+            for operator in self.datasource:
+                def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, bool]:
+                    try:
+                        video_key, video, caption = op()
+                        
+                        if not any(video_key.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+                            logger.warning(f"Skipping non-video file: {video_key}")
+                            return None, None, None, None, None
+                        
+                        frame_size = (video[0].shape[1], video[0].shape[0])
+                        bucket_reso = buckset_selector.get_bucket_resolution(frame_size)
+                        video = [resize_image_to_bucket(frame, bucket_reso) for frame in video]
+                        return frame_size, video_key, video, caption, False  # False indicates main dataset
+                    except Exception as e:
+                        logger.error(f"Error fetching and resizing video: {e}")
+                        raise
+
+                future = executor.submit(fetch_and_resize, operator)
+                futures.append(future)
+                aggregate_future()
+                while True:
+                    key, batch = submit_batch()
+                    if key is None:
+                        break
+                    yield key, batch
+
+            # Process conditioning videos if any
+            if self.conditioning_datasource is not None:
+                for operator in self.conditioning_datasource:
+                    def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, bool]:
+                        try:
+                            video_key, video, caption = op()
+                            
+                            if not any(video_key.lower().endswith(ext) for ext in VIDEO_EXTENSIONS):
+                                logger.warning(f"Skipping non-video file: {video_key}")
+                                return None, None, None, None, None
+                            
+                            frame_size = (video[0].shape[1], video[0].shape[0])
+                            bucket_reso = buckset_selector.get_bucket_resolution(frame_size)
+                            video = [resize_image_to_bucket(frame, bucket_reso) for frame in video]
+                            return frame_size, video_key, video, caption, True  # True indicates conditioning dataset
+                        except Exception as e:
+                            logger.error(f"Error fetching and resizing conditioning video: {e}")
+                            raise
+
+                    future = executor.submit(fetch_and_resize, operator)
+                    futures.append(future)
+                    aggregate_future()
+                    while True:
+                        key, batch = submit_batch()
+                        if key is None:
+                            break
+                        yield key, batch
+
+            # Final cleanup
+            aggregate_future(consume_all=True)
             while True:
-                key, batch = submit_batch()
+                key, batch = submit_batch(flush=True)
                 if key is None:
                     break
                 yield key, batch
 
-        aggregate_future(consume_all=True)
-        while True:
-            key, batch = submit_batch(flush=True)
-            if key is None:
-                break
-            yield key, batch
-
-        executor.shutdown()
-
+        finally:
+            # Ensure the executor is shut down properly
+            executor.shutdown(wait=True)        
+        
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
 
@@ -1227,7 +1382,8 @@ class VideoDataset(BaseDataset):
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
 
             bucket = bucketed_item_info.get(bucket_reso, [])
-            bucket.append(item_info)
+            for _ in range(self.num_repeats):
+                bucket.append(item_info)
             bucketed_item_info[bucket_reso] = bucket
 
         # prepare batch manager
@@ -1248,7 +1404,7 @@ class VideoDataset(BaseDataset):
 
     def __getitem__(self, idx):
         return self.batch_manager[idx]
-
+        
 
 class DatasetGroup(torch.utils.data.ConcatDataset):
     def __init__(self, datasets: Sequence[Union[ImageDataset, VideoDataset]]):
