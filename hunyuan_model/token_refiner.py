@@ -67,6 +67,9 @@ class IndividualTokenRefinerBlock(nn.Module):
     def enable_gradient_checkpointing(self):
         self.gradient_checkpointing = True
 
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
+
     def _forward(
         self,
         x: torch.Tensor,
@@ -91,13 +94,12 @@ class IndividualTokenRefinerBlock(nn.Module):
         x = x + apply_gate(self.mlp(self.norm2(x)), gate_mlp)
 
         return x
-    
+
     def forward(self, *args, **kwargs):
         if self.training and self.gradient_checkpointing:
             return checkpoint(self._forward, *args, use_reentrant=False, **kwargs)
         else:
             return self._forward(*args, **kwargs)
-            
 
 
 class IndividualTokenRefiner(nn.Module):
@@ -137,6 +139,10 @@ class IndividualTokenRefiner(nn.Module):
     def enable_gradient_checkpointing(self):
         for block in self.blocks:
             block.enable_gradient_checkpointing()
+
+    def disable_gradient_checkpointing(self):
+        for block in self.blocks:
+            block.disable_gradient_checkpointing()
 
     def forward(
         self,
@@ -213,12 +219,22 @@ class SingleTokenRefiner(nn.Module):
     def enable_gradient_checkpointing(self):
         self.individual_token_refiner.enable_gradient_checkpointing()
 
+    def disable_gradient_checkpointing(self):
+        self.individual_token_refiner.disable_gradient_checkpointing()
+
     def forward(
         self,
         x: torch.Tensor,
         t: torch.LongTensor,
         mask: Optional[torch.LongTensor] = None,
     ):
+        if x is None:
+            # Handle None input case
+            x = torch.zeros(
+                (t.shape[0], 1, self.input_embedder.in_features),  # (B, 1, in_channels)
+                device=t.device,
+                dtype=self.input_embedder.weight.dtype
+            )
         timestep_aware_representations = self.t_embedder(t)
 
         if mask is None:

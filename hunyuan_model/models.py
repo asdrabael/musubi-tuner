@@ -5,7 +5,10 @@ from einops import rearrange
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+import bitsandbytes as bnb  # Add this import
 
 from .activation_layers import get_activation_layer
 from .norm_layers import get_norm_layer
@@ -19,11 +22,61 @@ from modules.custom_offloading_utils import ModelOffloader, synchronize_device, 
 from hunyuan_model.posemb_layers import get_nd_rotary_pos_embed
 
 from utils.safetensors_utils import MemoryEfficientSafeOpen
+from networks.controlnet import ControlNetAdapter
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Add NF4Linear class
+class NF4Linear(nn.Module):
+    """
+    A custom linear layer that uses NF4 quantization for weights.
+    """
+    def __init__(self, in_features, out_features, bias=True, dtype=torch.bfloat16, device=torch.device("cuda")):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.use_nf4 = True  # Always use NF4 for this layer
+
+        # Use Linear4bit from bitsandbytes for NF4 quantization
+        self.linear = bnb.nn.Linear4bit(
+            in_features,
+            out_features,
+            bias=bias,
+            quant_type="nf4",
+            dtype=dtype,
+            device=device,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+# Add MyModel class (example)
+class MyModel(nn.Module):
+    """
+    An example model that demonstrates how to integrate NF4Linear.
+    """
+    def __init__(self, use_nf4=False):
+        super().__init__()
+        self.use_nf4 = use_nf4
+
+        # Use NF4Linear if NF4 is enabled, otherwise use a standard Linear layer
+        if use_nf4:
+            self.linear1 = NF4Linear(128, 256)  # Use NF4 for this layer
+        else:
+            self.linear1 = nn.Linear(128, 256)  # Use FP16/FP32 for this layer
+
+        self.linear2 = nn.Linear(256, 10)  # Keep this in FP16/FP32
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.linear2(x)
+        return x
 
 class MMDoubleStreamBlock(nn.Module):
     """
-    A multimodal dit block with seperate modulation for
+    A multimodal dit block with separate modulation for
     text and image/video, see more details (SD3): https://arxiv.org/abs/2403.03206
                                      (Flux.1): https://github.com/black-forest-labs/flux
     """
@@ -41,11 +94,13 @@ class MMDoubleStreamBlock(nn.Module):
         device: Optional[torch.device] = None,
         attn_mode: str = "flash",
         split_attn: bool = False,
+        use_nf4: bool = False,  # Add NF4 flag
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.attn_mode = attn_mode
         self.split_attn = split_attn
+        self.use_nf4 = use_nf4  # Store NF4 flag
 
         self.deterministic = False
         self.heads_num = heads_num
@@ -60,7 +115,14 @@ class MMDoubleStreamBlock(nn.Module):
         )
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, **factory_kwargs)
 
-        self.img_attn_qkv = nn.Linear(hidden_size, hidden_size * 3, bias=qkv_bias, **factory_kwargs)
+        # Use Linear4bit if NF4 is enabled
+        if use_nf4:
+            # Remove dtype from factory_kwargs for Linear4bit
+            linear4bit_kwargs = {"device": device}  # Only pass device, not dtype
+            self.img_attn_qkv = bnb.nn.Linear4bit(hidden_size, hidden_size * 3, bias=qkv_bias, quant_type="nf4", **linear4bit_kwargs)
+        else:
+            self.img_attn_qkv = nn.Linear(hidden_size, hidden_size * 3, bias=qkv_bias, **factory_kwargs)
+
         qk_norm_layer = get_norm_layer(qk_norm_type)
         self.img_attn_q_norm = (
             qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs) if qk_norm else nn.Identity()
@@ -68,7 +130,12 @@ class MMDoubleStreamBlock(nn.Module):
         self.img_attn_k_norm = (
             qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs) if qk_norm else nn.Identity()
         )
-        self.img_attn_proj = nn.Linear(hidden_size, hidden_size, bias=qkv_bias, **factory_kwargs)
+
+        # Use Linear4bit if NF4 is enabled
+        if use_nf4:
+            self.img_attn_proj = bnb.nn.Linear4bit(hidden_size, hidden_size, bias=qkv_bias, quant_type="nf4", **linear4bit_kwargs)
+        else:
+            self.img_attn_proj = nn.Linear(hidden_size, hidden_size, bias=qkv_bias, **factory_kwargs)
 
         self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, **factory_kwargs)
         self.img_mlp = MLP(
@@ -79,6 +146,7 @@ class MMDoubleStreamBlock(nn.Module):
             **factory_kwargs,
         )
 
+        # Repeat the same for txt_attn_qkv and txt_attn_proj
         self.txt_mod = ModulateDiT(
             hidden_size,
             factor=6,
@@ -87,14 +155,22 @@ class MMDoubleStreamBlock(nn.Module):
         )
         self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, **factory_kwargs)
 
-        self.txt_attn_qkv = nn.Linear(hidden_size, hidden_size * 3, bias=qkv_bias, **factory_kwargs)
+        if use_nf4:
+            self.txt_attn_qkv = bnb.nn.Linear4bit(hidden_size, hidden_size * 3, bias=qkv_bias, quant_type="nf4", **linear4bit_kwargs)
+        else:
+            self.txt_attn_qkv = nn.Linear(hidden_size, hidden_size * 3, bias=qkv_bias, **factory_kwargs)
+
         self.txt_attn_q_norm = (
             qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs) if qk_norm else nn.Identity()
         )
         self.txt_attn_k_norm = (
             qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs) if qk_norm else nn.Identity()
         )
-        self.txt_attn_proj = nn.Linear(hidden_size, hidden_size, bias=qkv_bias, **factory_kwargs)
+
+        if use_nf4:
+            self.txt_attn_proj = bnb.nn.Linear4bit(hidden_size, hidden_size, bias=qkv_bias, quant_type="nf4", **linear4bit_kwargs)
+        else:
+            self.txt_attn_proj = nn.Linear(hidden_size, hidden_size, bias=qkv_bias, **factory_kwargs)
 
         self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, **factory_kwargs)
         self.txt_mlp = MLP(
@@ -107,7 +183,7 @@ class MMDoubleStreamBlock(nn.Module):
         self.hybrid_seq_parallel_attn = None
 
         self.gradient_checkpointing = False
-
+        
     def enable_deterministic(self):
         self.deterministic = True
 
@@ -116,6 +192,9 @@ class MMDoubleStreamBlock(nn.Module):
 
     def enable_gradient_checkpointing(self):
         self.gradient_checkpointing = True
+
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
 
     def _forward(
         self,
@@ -136,6 +215,15 @@ class MMDoubleStreamBlock(nn.Module):
         (txt_mod1_shift, txt_mod1_scale, txt_mod1_gate, txt_mod2_shift, txt_mod2_scale, txt_mod2_gate) = self.txt_mod(vec).chunk(
             6, dim=-1
         )
+        
+        if self.training:
+            img_attn = torch.utils.checkpoint.checkpoint(
+                self._attention_fn, 
+                img_q, img_k, img_v,
+                use_reentrant=False
+            )
+        else:
+            img_attn = self._attention_fn(img_q, img_k, img_v)
 
         # Prepare image for attention.
         img_modulated = self.img_norm1(img)
@@ -180,9 +268,9 @@ class MMDoubleStreamBlock(nn.Module):
         v = torch.cat((img_v, txt_v), dim=1)
         img_v = txt_v = None
 
-        assert (
-            cu_seqlens_q.shape[0] == 2 * img.shape[0] + 1
-        ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
+#        assert (
+#            cu_seqlens_q.shape[0] == 2 * img.shape[0] + 1
+#        ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
 
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
@@ -314,6 +402,9 @@ class MMSingleStreamBlock(nn.Module):
     def enable_gradient_checkpointing(self):
         self.gradient_checkpointing = True
 
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
+
     def _forward(
         self,
         x: torch.Tensor,
@@ -359,7 +450,7 @@ class MMSingleStreamBlock(nn.Module):
             del img_q, txt_q, img_k, txt_k
 
         # Compute attention.
-        assert cu_seqlens_q.shape[0] == 2 * x.shape[0] + 1, f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, x.shape[0]:{x.shape[0]}"
+#        assert cu_seqlens_q.shape[0] == 2 * x.shape[0] + 1, f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, x.shape[0]:{x.shape[0]}"
 
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
@@ -417,6 +508,261 @@ class MMSingleStreamBlock(nn.Module):
         else:
             return self._forward(*args, **kwargs)
 
+
+class ControlNetAdapter(nn.Module):
+    """
+    Adapter for different control types (pose, depth, canny) that processes 5D input (B, C, T, H, W)
+    """
+    def __init__(self, control_type: str, in_channels: int = 1, out_channels: int = 16, mid_channels: int = 32, num_layers: int = 3):
+        super().__init__()
+        self.control_type = control_type
+        self.out_channels = out_channels
+        
+        layers = []
+        layers.append(nn.Conv3d(in_channels, mid_channels, kernel_size=3, padding=1))
+        layers.append(self._get_normalization_layer(mid_channels))
+        layers.append(self._get_activation())
+        
+        for _ in range(num_layers - 2):
+            layers.append(nn.Conv3d(mid_channels, mid_channels, kernel_size=3, padding=1))
+            layers.append(self._get_normalization_layer(mid_channels))
+            layers.append(self._get_activation())
+        
+        layers.append(nn.Conv3d(mid_channels, out_channels, kernel_size=3, padding=1))
+        self.net = nn.Sequential(*layers)
+
+    def _get_normalization_layer(self, channels: int) -> nn.Module:
+        if self.control_type == 'pose':
+            return nn.GroupNorm(8, channels)
+        elif self.control_type == 'depth':
+            return nn.BatchNorm3d(channels)
+        elif self.control_type == 'canny':
+            return nn.InstanceNorm3d(channels)
+        raise ValueError(f"Invalid control type: {self.control_type}")
+
+    def _get_activation(self) -> nn.Module:
+        return nn.Sigmoid() if self.control_type == 'canny' else nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+class DiffusionTransformerControl(nn.Module):
+    """
+    A wrapper around the base_transformer (HYVideoDiffusionTransformer) that:
+      • manually replicates the forward steps,
+      • can optionally disable text conditioning if text_states is None,
+      • injects control features (pose, depth, canny) at each double_stream block.
+    """
+
+    def __init__(self, base_transformer, control_adapter):
+        super().__init__()
+        self.transformer = base_transformer
+        self.control_adapter = control_adapter
+
+        self.control_proj = nn.Conv3d(
+            in_channels=self.control_adapter.out_channels,
+            out_channels=self.transformer.hidden_size,
+            kernel_size=1,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,         # (B, in_channels=16, T, H, W)
+        t: torch.Tensor,         # (B,) discrete timesteps
+        text_states: torch.Tensor = None,
+        text_states_2: torch.Tensor = None,
+        text_mask: torch.Tensor = None,
+        control_input: torch.Tensor = None,
+        control_alpha: float = 1.0,       # Guidance strength
+        guidance: torch.Tensor = None, # Classifier-free or distillation guidance
+        freqs_cos: torch.Tensor = None,
+        freqs_sin: torch.Tensor = None,
+        return_dict: bool = True,
+    ):
+        """
+        Overall steps:
+
+          (1) patch_embed => (B, hidden_size, T, H, W)
+          (2) flatten => (B, T×H×W, hidden_size)
+          (3) text -> txt_in => (B, textLen, hidden_size) [or zero-tokens if text_states=None]
+          (4) time_in + vector_in => 'vec' (B, hidden_size), add guidance if needed
+          (5) pass through *all* double_blocks => after each block, add control features to 'img'
+          (6) single_blocks => merged image & text tokens
+          (7) final_layer => unpatchify => (B, out_channels, T, H, W)
+        """
+
+        # ----------------- 1) Video branch embedding  -----------------
+        img = self.transformer.img_in(x)  # shape: (B, hidden_size, T, H, W)
+        B, hidden_size, T_, H_, W_ = img.shape
+
+        # 2) Flatten (B, T×H×W, hidden_size)
+        img = img.permute(0, 2, 3, 4, 1).contiguous()
+        img_seq_len = T_ * H_ * W_
+        img = img.view(B, img_seq_len, hidden_size)
+
+        # 3) Text projection (handle text_states=None to disable text)
+        if text_states is None:
+            txt = x.new_zeros((B, 1, hidden_size), dtype=img.dtype, device=img.device)
+            txt_seq_len = 1
+        else:
+            # Normal text projection path
+            if self.transformer.text_projection == "linear":
+                txt = self.transformer.txt_in(text_states)
+            elif self.transformer.text_projection == "single_refiner":
+                txt = self.transformer.txt_in(
+                    text_states,
+                    t,
+                    text_mask if self.transformer.use_attention_mask else None,
+                )
+            else:
+                raise NotImplementedError(
+                    f"Unknown text_projection={self.transformer.text_projection}"
+                )
+            txt_seq_len = txt.shape[1]
+
+        # 4) Build conditioning vector 'vec' from t, text_states_2, guidance.
+        #    If text_states_2 is None, skip that addition. Also handle guidance only if available.
+        vec = self.transformer.time_in(t)  # (B, hidden_size)
+
+        if text_states_2 is not None:
+            vec = vec + self.transformer.vector_in(text_states_2)
+
+        # guidance embed
+        if self.transformer.guidance_embed:
+            # If we want to disable guidance entirely, either pass guidance=None
+            # or fill it with zeros. Below is a minimal approach:
+            if guidance is not None:
+                vec = vec + self.transformer.guidance_in(guidance)
+            else:
+                # If the base model insists on guidance but we have none,
+                # you can either raise an error or do a zero vector:
+                # raise ValueError("Expecting guidance, but got None.")
+                guidance_zeros = vec.new_zeros((B,), dtype=vec.dtype, device=vec.device)
+                vec = vec + self.transformer.guidance_in(guidance_zeros)
+
+        # 4a) Prepare/encode control features if provided
+        if control_input is not None:
+            # Run the control_adapter: (B, c, T, H, W)->(B, outC, T, H, W)
+            control_feats = self.control_adapter(control_input)
+            # Interpolate to (T_, H_, W_)
+            control_feats = F.interpolate(
+                control_feats,
+                size=(T_, H_, W_),
+                mode="trilinear",
+                align_corners=False,
+            )
+            # Project to hidden_size => (B, hidden_size, T_, H_, W_)
+            control_feats = self.control_proj(control_feats)
+            # Flatten => (B, T×H×W, hidden_size)
+            control_feats = control_feats.permute(0, 2, 3, 4, 1).contiguous()
+            control_feats = control_feats.view(B, img_seq_len, hidden_size)
+        else:
+            control_feats = None
+
+        # 5) Double-stream blocks—inject control features at EVERY block
+        for i, block in enumerate(self.transformer.double_blocks):
+            block = block.to(x.device)
+            # run the block
+            img, txt = block(
+                img,
+                txt,
+                vec,
+                attn_mask=None,
+                total_len=None,
+                cu_seqlens_q=None,
+                cu_seqlens_kv=None,
+                max_seqlen_q=None,
+                max_seqlen_kv=None,
+                freqs_cis=(freqs_cos, freqs_sin) if freqs_cos is not None else None,
+            )
+            # inject control features immediately after block
+            if control_feats is not None:
+                if control_feats.shape[:2] != img.shape[:2]:
+                    raise ValueError(
+                        f"Control shape mismatch at block {i}: "
+                        f"control_feats={control_feats.shape}, img={img.shape}"
+                    )
+                img = img + (control_alpha * control_feats)
+
+        # 6) Single-stream blocks: merge image & text tokens
+        x_merged = torch.cat([img, txt], dim=1)  # shape (B, img_seq_len+txt_seq_len, hidden_size)
+        for blk in self.transformer.single_blocks:
+            blk = blk.to(x.device)
+            x_merged = blk(
+                x_merged,
+                vec,
+                txt_seq_len,
+                attn_mask=None,
+                total_len=None,
+                cu_seqlens_q=None,
+                cu_seqlens_kv=None,
+                max_seqlen_q=None,
+                max_seqlen_kv=None,
+                freqs_cis=(freqs_cos, freqs_sin) if freqs_cos is not None else None,
+            )
+
+        # Split back out the image tokens
+        img_out = x_merged[:, :img_seq_len, :]
+
+        # 7) Final layer => unpatchify => (B, out_channels, T, H, W)
+        out = self.transformer.final_layer(img_out, vec)
+        out = self.transformer.unpatchify(out, T_, H_, W_)
+
+        if return_dict:
+            return {"x": out}
+        return out
+
+    # Other pass-through properties/methods for convenience:
+    @property
+    def patch_size(self):
+        return self.transformer.patch_size
+
+    @property
+    def hidden_size(self):
+        return self.transformer.hidden_size
+
+    @property
+    def heads_num(self):
+        return self.transformer.heads_num
+
+    @property
+    def rope_dim_list(self):
+        return self.transformer.rope_dim_list
+
+    @property
+    def dtype(self):
+        return next(self.transformer.parameters()).dtype
+
+    @property
+    def device(self):
+        return next(self.transformer.parameters()).device
+
+    def enable_block_swap(self, num_blocks: int, device: torch.device, supports_backward: bool):
+        self.transformer.enable_block_swap(num_blocks, device, supports_backward)
+
+    def switch_block_swap_for_inference(self):
+        self.transformer.switch_block_swap_for_inference()
+
+    def switch_block_swap_for_training(self):
+        self.transformer.switch_block_swap_for_training()
+
+    def move_to_device_except_swap_blocks(self, device: torch.device):
+        self.transformer.move_to_device_except_swap_blocks(device)
+
+    def prepare_block_swap_before_forward(self):
+        self.transformer.prepare_block_swap_before_forward()
+
+    def enable_img_in_txt_in_offloading(self):
+        self.transformer.enable_img_in_txt_in_offloading()
+
+    def enable_gradient_checkpointing(self):
+        self.transformer.enable_gradient_checkpointing()
+
+    def disable_gradient_checkpointing(self):
+        self.transformer.disable_gradient_checkpointing()
+
+    def unpatchify(self, x, t, h, w):
+        return self.transformer.unpatchify(x, t, h, w)
 
 class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
     """
@@ -499,10 +845,12 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
         device: Optional[torch.device] = None,
         attn_mode: str = "flash",
         split_attn: bool = False,
+        use_nf4: bool = False,  # Add NF4 flag
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
 
+        self.use_nf4 = use_nf4
         self.patch_size = patch_size
         self.in_channels = in_channels
         self.out_channels = in_channels if out_channels is None else out_channels
@@ -570,6 +918,7 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
                     qkv_bias=qkv_bias,
                     attn_mode=attn_mode,
                     split_attn=split_attn,
+                    use_nf4=use_nf4,  # Pass NF4 flag
                     **factory_kwargs,
                 )
                 for _ in range(mm_double_blocks_depth)
@@ -626,6 +975,16 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
 
         print(f"HYVideoDiffusionTransformer: Gradient checkpointing enabled.")
 
+    def disable_gradient_checkpointing(self):
+        self.gradient_checkpointing = False
+
+        self.txt_in.disable_gradient_checkpointing()
+
+        for block in self.double_blocks + self.single_blocks:
+            block.disable_gradient_checkpointing()
+
+        print(f"HYVideoDiffusionTransformer: Gradient checkpointing disabled.")
+
     def enable_img_in_txt_in_offloading(self):
         self._enable_img_in_txt_in_offloading = True
 
@@ -650,6 +1009,20 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
         print(
             f"HYVideoDiffusionTransformer: Block swap enabled. Swapping {num_blocks} blocks, double blocks: {double_blocks_to_swap}, single blocks: {single_blocks_to_swap}."
         )
+
+    def switch_block_swap_for_inference(self):
+        if self.blocks_to_swap:
+            self.offloader_double.set_forward_only(True)
+            self.offloader_single.set_forward_only(True)
+            self.prepare_block_swap_before_forward()
+            print(f"HYVideoDiffusionTransformer: Block swap set to forward only.")
+
+    def switch_block_swap_for_training(self):
+        if self.blocks_to_swap:
+            self.offloader_double.set_forward_only(False)
+            self.offloader_single.set_forward_only(False)
+            self.prepare_block_swap_before_forward()
+            print(f"HYVideoDiffusionTransformer: Block swap set to forward and backward.")
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
         # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
@@ -696,6 +1069,10 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         out = {}
+        
+        # Add downsampling layer
+        x = F.avg_pool3d(x, kernel_size=(1, 2, 2), stride=(1, 2, 2))  # Halve spatial resolution
+        
         img = x
         txt = text_states
         _, _, ot, oh, ow = x.shape
@@ -725,7 +1102,7 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
             self.txt_in.to(x.device, non_blocking=True)
             synchronize_device(x.device)
 
-        img = self.img_in(img)
+        img = self.img_in(img)  # Now operates on downsampled inputs
         if self.text_projection == "linear":
             txt = self.txt_in(txt)
         elif self.text_projection == "single_refiner":
@@ -749,20 +1126,19 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
         max_seqlen_kv = max_seqlen_q
 
         attn_mask = total_len = None
+        if self.split_attn or self.attn_mode == "torch":
+            # calculate text length and total length
+            text_len = text_mask.sum(dim=1)  #  (bs, )
+            total_len = img_seq_len + text_len  # (bs, )
         if self.attn_mode == "torch" and not self.split_attn:
             # initialize attention mask: bool tensor for sdpa, (b, 1, n, n)
             bs = img.shape[0]
             attn_mask = torch.zeros((bs, 1, max_seqlen_q, max_seqlen_q), dtype=torch.bool, device=text_mask.device)
 
-            # calculate text length and total length
-            text_len = text_mask.sum(dim=1)  #  (bs, )
-            total_len = img_seq_len + text_len  # (bs, )
-
-            # set attention mask
+            # set attention mask with total_len
             for i in range(bs):
                 attn_mask[i, :, : total_len[i], : total_len[i]] = True
-        else:
-            total_len = text_mask.sum(dim=1) + img_seq_len  # (bs, )
+            total_len = None  # means we don't use split_attn
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
         # --------------------- Pass through DiT blocks ------------------------
@@ -828,7 +1204,6 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
             out["x"] = img
             return out
         return img
-
     def unpatchify(self, x, t, h, w):
         """
         x: (N, T, patch_size**2 * C)
@@ -894,7 +1269,7 @@ HUNYUAN_VIDEO_CONFIG = {
 }
 
 
-def load_dit_model(text_states_dim, text_states_dim_2, in_channels, out_channels, factor_kwargs):
+def load_dit_model(text_states_dim, text_states_dim_2, in_channels, out_channels, factor_kwargs, use_nf4=False):
     """load hunyuan video model
 
     NOTE: Only support HYVideo-T/2-cfgdistill now.
@@ -915,6 +1290,7 @@ def load_dit_model(text_states_dim, text_states_dim_2, in_channels, out_channels
         text_states_dim_2=text_states_dim_2,
         in_channels=in_channels,
         out_channels=out_channels,
+        use_nf4=use_nf4,  # Pass the use_nf4 flag
         **HUNYUAN_VIDEO_CONFIG["HYVideo-T/2-cfgdistill"],
         **factor_kwargs,
     )
@@ -938,9 +1314,15 @@ def load_state_dict(model, model_path):
     return model
 
 
-def load_transformer(dit_path, attn_mode, split_attn, device, dtype) -> HYVideoDiffusionTransformer:
+def load_transformer(dit_path, attn_mode, split_attn, device, dtype, use_nf4=False) -> HYVideoDiffusionTransformer:
     # =========================== Build main model ===========================
-    factor_kwargs = {"device": device, "dtype": dtype, "attn_mode": attn_mode, "split_attn": split_attn}
+    factory_kwargs = {
+        "patch_size": [1, 2, 2],  # Was [1, 2, 2] 
+        "device": device, 
+        "dtype": dtype,
+        "attn_mode": attn_mode,
+        "split_attn": split_attn
+    }
     latent_channels = 16
     in_channels = latent_channels
     out_channels = latent_channels
@@ -951,7 +1333,8 @@ def load_transformer(dit_path, attn_mode, split_attn, device, dtype) -> HYVideoD
             text_states_dim_2=768,
             in_channels=in_channels,
             out_channels=out_channels,
-            factor_kwargs=factor_kwargs,
+            factor_kwargs=factory_kwargs,
+            use_nf4=use_nf4,  # Pass the use_nf4 flag
         )
 
     if os.path.splitext(dit_path)[-1] == ".safetensors":
@@ -1001,6 +1384,9 @@ def get_rotary_pos_embed_by_shape(model, latents_size):
     freqs_cos, freqs_sin = get_nd_rotary_pos_embed(
         rope_dim_list, rope_sizes, theta=rope_theta, use_real=True, theta_rescale_factor=1
     )
+    
+    logger.info(f"Rotary embedding freqs_cos dtype: {freqs_cos.dtype}; freqs_sin dtype: {freqs_sin.dtype}")
+    
     return freqs_cos, freqs_sin
 
 

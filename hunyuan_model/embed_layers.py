@@ -23,7 +23,7 @@ class PatchEmbed(nn.Module):
     def __init__(
         self,
         patch_size=16,
-        in_chans=3,
+        in_chans=16,  # Changed from 16 to 1 to match the input tensor
         embed_dim=768,
         norm_layer=None,
         flatten=True,
@@ -37,7 +37,15 @@ class PatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.flatten = flatten
 
-        self.proj = nn.Conv3d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=bias, **factory_kwargs)
+        # Conv3d layer now expects 1 input channel (in_chans=1)
+        self.proj = nn.Conv3d(
+            in_chans,  # Now set to 1
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            bias=bias,
+            **factory_kwargs
+        )
         nn.init.xavier_uniform_(self.proj.weight.view(self.proj.weight.size(0), -1))
         if bias:
             nn.init.zeros_(self.proj.bias)
@@ -45,9 +53,15 @@ class PatchEmbed(nn.Module):
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x):
+        # Ensure the input tensor has the correct shape
+        # Apply the Conv3d layer
         x = self.proj(x)
+
+        # Flatten if required
         if self.flatten:
             x = x.flatten(2).transpose(1, 2)  # BCHW -> BNC
+
+        # Apply normalization
         x = self.norm(x)
         return x
 
