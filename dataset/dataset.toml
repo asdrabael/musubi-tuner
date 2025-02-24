@@ -1,0 +1,20 @@
+# resolution, caption_extension, batch_size, enable_bucket, bucket_no_upscale must be set in either general or datasets
+
+# general configurations
+[general]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = false
+resolution = [256, 256]  # Add resolution to general section
+
+[[datasets]]
+video_directory = "/path/to/video"
+target_frames = [#]
+frame_extraction = "head"
+cache_directory = "/path/to/cache"
+conditioning_directory = "/path/to/controlnet/inputs"
+conditioning_cache = "/path/to/controlnet/cache"
+resolution = [###, ###]
+
+# other datasets can be added here. each dataset can have different configurations
